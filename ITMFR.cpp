@@ -24,15 +24,23 @@ void MallocDebug_free(void* ptr);
 
 // ----------------------------------------------------------------------------
 
+// init for reading the import table and finding the functions to intercept
 bool initialized = false;
+// switched for telling the state, if the original functions are disabled and the debug functions are enabled
 bool switched = false;
 
+// number of functions
 constexpr size_t funcCount = 4;
 
+// read/write protection for the IAT entries
 DWORD oldProtect[funcCount] = { 0, 0, 0, 0 };
+// addresses in the IAT
+// dereference to overwrite the function address
 ULONGLONG* originAddr[funcCount] = { nullptr, nullptr, nullptr, nullptr };
 
+// original function addresses
 ULONGLONG funcAddr[funcCount] = { 0, 0, 0, 0 };
+// our debug functions addresses
 ULONGLONG myFuncAddr[funcCount] = { 
 	(ULONGLONG)MallocDebug_malloc,
 	(ULONGLONG)MallocDebug_calloc,
@@ -40,12 +48,69 @@ ULONGLONG myFuncAddr[funcCount] = {
 	(ULONGLONG)MallocDebug_free
 };
 
+// functions to be intercepted, HAS to be in the same order as the arrays above
 const char* funcNames[funcCount] = { "malloc", "calloc", "realloc", "free" };
 
-std::unordered_map<void*, size_t> allocatedMemory;
+PIMAGE_DOS_HEADER pDosHeader;
+// function pointer types for the original functions
+typedef void* (*malloc_t)(size_t);
+typedef void* (*calloc_t)(size_t, size_t);
+typedef void* (*realloc_t)(void*, size_t);
+typedef void (*free_t)(void*);
+
+// ----------------------------------------------------------------------------
+
+struct MemoryBlock
+{
+	size_t size;
+	size_t used_function;
+	void* old_ptr;
+	size_t num;
+};
+
+// checking for double frees and memory leaks
+std::unordered_map<void*, MemoryBlock> allocatedMemory;
 std::unordered_set<void*> freedMemory;
 
-PIMAGE_DOS_HEADER pDosHeader;
+// ----------------------------------------------------------------------------
+
+void DisableOriginal()
+{
+	// Disable original functions by replacing the IAT entries with our debug functions addresses
+
+	if (!initialized)
+		return;
+
+	for (size_t i = 0; i < funcCount; i++)
+	{
+		if (!funcAddr[i])
+			continue;
+
+		oldProtect[i] = PAGE_EXECUTE_READWRITE;
+
+		VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &oldProtect[i]);
+		*(originAddr[i]) = myFuncAddr[i];
+		VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &oldProtect[i]);
+	}
+}
+
+void EnableOriginal()
+{
+	// Enable original functions by restoring the IAT entries with the original function addresses
+
+	if (!initialized)
+		return;
+
+	for (size_t i = 0; i < funcCount; i++)
+	{
+		if (!funcAddr[i])
+			continue;
+
+		VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &(oldProtect[i]));
+		*(originAddr[i]) = funcAddr[i];
+		VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &(oldProtect[i]));
+	}
+}
 
 // ----------------------------------------------------------------------------
 
@@ -58,15 +123,7 @@ void MallocDebug_Init()
 		HMODULE hPEFile = GetModuleHandle(NULL);
 		pDosHeader = (PIMAGE_DOS_HEADER)hPEFile;
 
-		// Položka pDosHeader->e_lfanew pak obsahuje relativní virtuální adresu (RVA) NT
-		// hlavičky PIMAGE_NT_HEADERS vzhledem k začátku PE souboru (tj. od bázové adresy
-		// vrácené funkcí GetModuleHandle):
 		PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((BYTE*)pDosHeader + pDosHeader->e_lfanew);
-
-		// Struktura IMAGE_NT_HEADERS obsahuje v struktuře pNTHeaders->OptionalHeader
-		// pole s datovými adresáři DataDirectory, z nichž každý obsahuje položku
-		// VirtualAddress (RVA od pDosHeader) a položku Size s velikostí adresáře
-		// v bajtech. Z těchto adresářů jsou pro toto cvičení důležité:
 
 		// import table (IMAGE_DIRECTORY_ENTRY_IMPORT)
 		IMAGE_DATA_DIRECTORY importTable = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -100,55 +157,57 @@ void MallocDebug_Init()
 			PIMAGE_THUNK_DATA pThunk = (PIMAGE_THUNK_DATA)((BYTE*)pDosHeader + id.OriginalFirstThunk);
 			PIMAGE_THUNK_DATA pIATThunk = (PIMAGE_THUNK_DATA)((BYTE*)pDosHeader + id.FirstThunk);
 
+			// if any of the thunks is null, skip this import descriptor, probably a malformed PE file or bug
+			if (pThunk == nullptr || pIATThunk == nullptr)
+			{
+				std::cout << "Error: Invalid thunk data" << std::endl;
+				continue;
+			}
+
 			while (pThunk->u1.AddressOfData != 0)
 			{
 				if (pThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
 				{
+					// Import by ordinal
 					PIMAGE_THUNK_DATA ordinal = (PIMAGE_THUNK_DATA)(pThunk->u1.Ordinal & 0xFFFF);
 
-					// Import by ordinal
-					std::cout << "  Ordinal: " << ordinal << std::endl;
+					std::cout << "  Warning: ordinal " << ordinal << " ignored" << std::endl;
 				}
 				else
 				{
-					// Import by name
+					// get the name and hint
 					PIMAGE_IMPORT_BY_NAME pImportByName = (PIMAGE_IMPORT_BY_NAME)((BYTE*)pDosHeader + pThunk->u1.AddressOfData);
-					//std::cout << "  Function: " << pImportByName->Name << std::endl;
-						//<< " at address: " << std::hex << (ULONGLONG)((BYTE*)pDosHeader + pIATThunk->u1.Function) << std::dec << std::endl << std::endl;
 
-					// Check if the function is one of the functions we want to hook
+					// Check if the function is one of the functions we want to intercept
 					for (size_t i = 0; i < funcCount; i++) {
 						if ((void*)originAddr[i] != nullptr)
 							continue;
 
 						if (strcmp(pImportByName->Name, funcNames[i]) == 0) {
-							originAddr[i] = (ULONGLONG*)&pIATThunk->u1.Function;
-							funcAddr[i] = *originAddr[i];
+							originAddr[i] = &(pIATThunk->u1.Function);
+							funcAddr[i] = pIATThunk->u1.Function;
 
 							std::cout << "    Found function: " << funcNames[i] << " at address: " << std::hex << funcAddr[i] << std::dec << std::endl;
 						}
 					}
 				}
 
+				// parallel iteration of the thunks, same order
 				pIATThunk++;
 				pThunk++;
 			}
 		}
 
 		initialized = true;
-		std::cout << std::endl;
 
 		for (size_t i = 0; i < funcCount; i++)
 		{
-			if ((void*)originAddr[i] == nullptr)
+			if (!funcAddr[i])
 			{
-				std::cerr << "Error: Function " << funcNames[i] << " not found in import table." << std::endl;
-				initialized = false;
+				std::cout << "Warning: Function " << funcNames[i] << " NOT found in import table, wont be used." << std::endl;
 			}
 		}
-
-		if (!initialized)
-			exit(1);
+		std::cout << std::endl;
 
 		system("pause");
 	}
@@ -156,24 +215,12 @@ void MallocDebug_Init()
 	if (!switched && initialized)
 	{
 		std::cout << "Switching to debug functions..." << std::endl;
-
-		for (size_t i = 0; i < funcCount; i++)
-		{
-			oldProtect[i] = PAGE_EXECUTE_READWRITE;
-
-			VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &oldProtect[i]);
-			*originAddr[i] = myFuncAddr[i];
-			VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &oldProtect[i]);
-
-			std::cout << "    Switched function: " << funcNames[i] << std::endl
-				<< "	From address: " << std::hex << funcAddr[i] << " to address: " << myFuncAddr[i] << std::dec << std::endl;
-		}
-		std::cout << std::endl;
+		DisableOriginal();
 
 		switched = true;
-
-		system("pause");
 	}
+
+	std::cout << std::endl;
 }
 void MallocDebug_Done()
 {
@@ -181,48 +228,63 @@ void MallocDebug_Done()
 
 	if (switched)
 	{
-		for (size_t i = 0; i < funcCount; i++)
-		{
-			VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &oldProtect[i]);
-			*originAddr[i] = funcAddr[i];
-			VirtualProtect(originAddr[i], sizeof(ULONGLONG), oldProtect[i], &oldProtect[i]);
-		}
+		std::cout << "Switching to original functions..." << std::endl;
+		EnableOriginal();
 
 		switched = false;
 	}
 
-	for (const auto& [ptr, size] : allocatedMemory)
+	// memory leaks
+	for (const auto& [ptr, block] : allocatedMemory)
 	{
-		std::cerr << "Warning: Memory leak detected for pointer: " << ptr << ", size: " << size << " bytes" << std::endl;
+		std::cout << "Warning: Memory leak detected: " << ptr << std::endl;
+		std::cout << "	function: " << funcNames[block.used_function] << std::endl;
+		if (block.used_function == 0) {
+			std::cout << "	size: " << block.size << std::endl;
+		}
+		else if (block.used_function == 1) {
+			std::cout << "	size: " << block.num << " * " << block.size << " (" << block.num * block.size << ")" << std::endl;
+		}
+		else if (block.used_function == 2) {
+			std::cout << "	size: " << block.size << std::endl;
+			std::cout << "	old_ptr: " << std::hex << block.old_ptr << std::dec << std::endl;
+		}
 	}
-
 	if (allocatedMemory.empty())
 	{
 		std::cout << "No memory leaks detected." << std::endl;
 	}
 
 	switched = false;
+
+	std::cout << std::endl;
 }
 
 void* MallocDebug_malloc(size_t size)
 {
 	std::cout << "MallocDebug_malloc(" << size << ")" << std::endl;
-	std::cout << "This: " << std::hex << (ULONGLONG)MallocDebug_malloc << std::endl;
-	std::cout << "Calling original: " << funcAddr[0] << std::dec << std::endl << std::endl;
 
-	system("pause");
-
-	if (!initialized) {
-		std::cerr << "Error: Not initialized" << std::endl;
+	if (!funcAddr[0]) {
+		std::cout << "Error: malloc function not found" << std::endl << std::endl;
 		return nullptr;
 	}
 
-	void* ptr = ((void* (*)(size_t))funcAddr[0])(size);
+	malloc_t original_malloc = (malloc_t)(uintptr_t)funcAddr[0];
+	void* ptr = original_malloc(size);
+
+	std::cout << "ptr = " << std::hex << ptr << std::dec << std::endl << std::endl;
+
+	// can return nullptr if error
+	// dont add the nullptr in the allocatedMemory map, not a valid pointer
 	if (ptr == nullptr)
 		return ptr;
 
+	// remove from already freed memory, it is being allocated again
+	// and add to allocated memory to be then checked for leaks
+	EnableOriginal();
 	freedMemory.erase(ptr);
-	allocatedMemory.insert({ ptr, size });
+	allocatedMemory.insert({ ptr, { size, 0, nullptr, 0 } });
+	DisableOriginal();
 
 	return ptr;
 }
@@ -231,44 +293,56 @@ void* MallocDebug_calloc(size_t num, size_t size)
 {
 	std::cout << "MallocDebug_calloc(" << num << ", " << size << ")" << std::endl;
 
-	if (!initialized) {
-		std::cerr << "Error: Not initialized" << std::endl;
+	if (!funcAddr[1]) {
+		std::cout << "Error: calloc function not found" << std::endl << std::endl;
 		return nullptr;
 	}
 
-	void* ptr = ((void* (*)(size_t, size_t))funcAddr[1])(num, size);
+	calloc_t original_calloc = (calloc_t)(uintptr_t)funcAddr[1];
+	void* ptr = original_calloc(num, size);
+
+	std::cout << "ptr = " << std::hex << ptr << std::dec << std::endl << std::endl;
+
+	// can return nullptr if error
 	if (ptr == nullptr)
 		return ptr;
 
+	EnableOriginal();
 	freedMemory.erase(ptr);
-	allocatedMemory.insert({ ptr, num * size });
+	allocatedMemory.insert({ ptr, { size, 1, nullptr, num } });
+	DisableOriginal();
 
 	return ptr;
 }
 
 void* MallocDebug_realloc(void* oldPtr, size_t size)
 {
-	std::cout << "MallocDebug_realloc(" << oldPtr << ", " << size << ")" << std::endl;
+	std::cout << "MallocDebug_realloc(" << std::hex << oldPtr << std::dec << ", " << size << ")" << std::endl;
 
-	if (!initialized) {
-		std::cerr << "Error: Not initialized" << std::endl;
+	if (!funcAddr[2]) {
+		std::cout << "Error: realloc function not found" << std::endl << std::endl;
 		return nullptr;
 	}
 
-	void* ptr = ((void* (*)(void*, size_t))funcAddr[2])(oldPtr, size);
-	
-	// failure, old is not freed and still valid
+	realloc_t original_realloc = (realloc_t)(uintptr_t)funcAddr[2];
+	void* ptr = original_realloc(oldPtr, size);
+
+	std::cout << "ptr = " << std::hex << ptr << std::dec << std::endl << std::endl;
+
 	if (ptr == nullptr)
 		return ptr;
 
-	// acts as a malloc
+	EnableOriginal();
 	if (oldPtr == nullptr) {
+		// acts as a malloc
 		// in case of a realloc calling malloc internally
 		// dont add, it was already done by the malloc call, which is overriden as well
+
 		if (!allocatedMemory.contains(ptr)) {
 			freedMemory.erase(ptr);
-			allocatedMemory.insert({ ptr, size });
+			allocatedMemory.insert({ ptr, { size, 2, oldPtr, 0 } });
 		}
+		DisableOriginal();
 
 		return ptr;
 	}
@@ -276,52 +350,64 @@ void* MallocDebug_realloc(void* oldPtr, size_t size)
 	freedMemory.erase(ptr);
 
 	if (ptr != oldPtr) {
+		// entirely new allocation
+		// old pointer freed, new pointer allocated
 		freedMemory.insert(oldPtr);
-
 		allocatedMemory.erase(oldPtr);
-		allocatedMemory.insert({ ptr, size });
+
+		allocatedMemory.insert({ ptr, { size, 2, oldPtr, 0 } });
 	}
 	else {
-		allocatedMemory[ptr] = size;
+		// expanding existing allocation, instead of entirely new allocation
+		allocatedMemory[ptr] = { size, 2, oldPtr, 0 };
 	}
+	DisableOriginal();
 
 	return ptr;
 }
 
 void MallocDebug_free(void* ptr)
 {
-	std::cout << "MallocDebug_free(" << ptr << ")" << std::endl;
+	std::cout << "MallocDebug_free(" << std::hex << ptr << std::dec << ")" << std::endl;
 
-	if (!initialized) {
-		std::cerr << "Error: Not initialized" << std::endl;
+	if (!funcAddr[3]) {
+		std::cout << "Error: free function not found" << std::endl << std::endl;
 		return;
 	}
 
 	if (ptr == nullptr) {
+		// freeing nullptr is valid, but warn about it
 		std::cout << "Warning: Freeing nullptr pointer" << std::endl;
 	}
 	else {
+		// check for double free and freeing not allocated pointer
+		EnableOriginal();
 		if (freedMemory.contains(ptr)) {
-			std::cerr << "Warning: Double free detected for pointer: " << ptr << std::endl;
+			std::cout << "Warning: Double free detected for pointer: " << ptr << std::endl;
 		}
 		else if (!allocatedMemory.contains(ptr)) {
-			std::cerr << "Warning: Freeing not allocated pointer: " << ptr << std::endl;
+			std::cout << "Warning: Freeing not allocated pointer: " << ptr << std::endl;
 		}
 
+		// clean up after free
 		freedMemory.insert(ptr);
 		allocatedMemory.erase(ptr);
+		DisableOriginal();
 	}
 
-	((void (*)(void*))funcAddr[3])(ptr);
+	std::cout << std::endl;
+
+	free_t original_free = (free_t)(uintptr_t)funcAddr[3];
+	original_free(ptr);
 }
 
 // ----------------------------------------------------------------------------
 
 int main()
 {
-	// Test normal
-
 	try {
+		// Test normal
+
 		MallocDebug_Init();
 
 		void* ptr = malloc(10);
@@ -338,9 +424,11 @@ int main()
 		void* ptr3 = realloc(ptr, 20);
 
 		MallocDebug_Done();
+
+		// Done
 	}
 	catch (const std::exception& e) {
-		std::cerr << "Exception: " << e.what() << std::endl;
+		std::cout << "Exception: " << e.what() << std::endl;
 	}
 
 	system("pause");
