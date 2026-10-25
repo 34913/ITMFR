@@ -14,6 +14,9 @@
 
 // ----------------------------------------------------------------------------
 
+void DisableOriginal();
+void EnableOriginal();
+
 void MallocDebug_Init();
 void MallocDebug_Done();
 
